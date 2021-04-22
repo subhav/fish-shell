@@ -192,14 +192,14 @@ static void read_init(parser_t &parser, const struct config_paths_t &paths) {
     }
 }
 
-// TODO: Using an int reference is ugly. Just return the new fd.
-void try_open(int& fd, const std::string& path) {
+int try_open(int fd, const std::string& path, int flags) {
     if (fd > 2) {
         close(fd);
-        if (!path.empty()) {
-            fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
-        }
     }
+    if (path.empty()) {
+        return -1;
+    }
+    return open(path.c_str(), flags | O_CLOEXEC);
 }
 
 int my_read_loop(parser_t &parser) {
@@ -207,25 +207,32 @@ int my_read_loop(parser_t &parser) {
     // In particular, wcstring_tok() looks similar
     const std::string whitespace = " \t\n";
     int in_fd = 0, out_fd = 1, err_fd = 2;
+    // We'll overwrite the vector when we run the "stdio" method.
+    io_chain_t ios {
+        std::make_shared<io_fd_t>(STDIN_FILENO, STDIN_FILENO),
+        std::make_shared<io_fd_t>(STDOUT_FILENO, STDOUT_FILENO),
+        std::make_shared<io_fd_t>(STDERR_FILENO, STDERR_FILENO)
+    };
 
-    std::string protocol_command;
-    while (std::getline(std::cin, protocol_command, '\0').good()) {
+    std::string message;
+    // Read entire message until NUL
+    while (std::getline(std::cin, message, '\0').good()) {
         std::string::size_type pos = 0;
         // Move ahead to first token
-        pos = protocol_command.find_first_not_of(whitespace, pos);
+        pos = message.find_first_not_of(whitespace, pos);
         // Returns an empty string if there are no more tokens.
         auto next_token = [&] () -> std::string {
             if (pos == std::string::npos) {
                 return {};
             }
             auto start = pos;
-            pos = protocol_command.find_first_of(whitespace, pos);
+            pos = message.find_first_of(whitespace, pos);
             auto len = (pos == std::string::npos) ? std::string::npos : pos-start;
             // Move ahead to next token
             if (pos != std::string::npos) {
-                pos = protocol_command.find_first_not_of(whitespace, pos);
+                pos = message.find_first_not_of(whitespace, pos);
             }
-            return protocol_command.substr(start, len);
+            return message.substr(start, len);
         };
 
         std::string method = next_token();
@@ -235,19 +242,37 @@ int my_read_loop(parser_t &parser) {
             in = next_token();
             out = next_token();
             err = next_token();
-            try_open(in_fd, in);
-            try_open(out_fd, out);
-            try_open(err_fd, err);
+            in_fd = try_open(in_fd, in, O_RDONLY);
+            out_fd = try_open(out_fd, out, O_WRONLY);
+            err_fd = try_open(err_fd, err, O_WRONLY);
+//            ios.push_back(std::make_shared<io_fd_t>(STDIN_FILENO, in_fd));
+//            ios.push_back(std::make_shared<io_fd_t>(STDOUT_FILENO, out_fd));
+//            ios.push_back(std::make_shared<io_fd_t>(STDERR_FILENO, err_fd));
+            ios[0] = std::make_shared<io_fd_t>(STDIN_FILENO, in_fd);
+            ios[1] = std::make_shared<io_fd_t>(STDOUT_FILENO, out_fd);
+            ios[2] = std::make_shared<io_fd_t>(STDERR_FILENO, err_fd);
         } else if (method == "run") {
+            // TODO: read_i() does some history manipulation that we need
             std::string commandstr;
             if (pos == std::string::npos) {
                 commandstr = {};
             } else {
-                commandstr = protocol_command.substr(pos);
+                commandstr = message.substr(pos);
             }
 
             wcstring command = str2wcstring(commandstr);
-            parser.eval(command, {});
+//            auto src = parse_source(command, parse_flag_none, {});
+            parser.eval(command, ios);
+            int status = parser.get_last_status();
+            // Could also call builtin_pwd
+            wcstring dir;
+            if (auto tmp = parser.vars().get(L"PWD")) {
+                dir = tmp->as_string();
+            }
+            fprintf(stdout, "{\"Done\": true, \"Exit\": %d, \"Dir\": \"%ls\"}\n", status, dir.c_str());
+
+        } else if (method == "exit") {
+            return 0;
         } else {
             fprintf(stderr, "Unknown method: %s\n", method.c_str());
         }
