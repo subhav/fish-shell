@@ -187,6 +187,10 @@ target_include_directories(fishlib PRIVATE
 add_executable(fish src/fish.cpp)
 fish_link_deps_and_sign(fish)
 
+# Define fish_server.
+add_executable(fish_server src/fish_server.cpp)
+fish_link_deps_and_sign(fish_server)
+
 # Define fish_indent.
 add_executable(fish_indent
                src/fish_indent.cpp src/print_help.cpp)
