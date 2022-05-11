@@ -1,5 +1,5 @@
 //
-// The main loop of the fish program.
+// Alternate fish main loop, for using interactively by another process.
 /*
 Copyright (C) 2005-2008 Axel Liljencrantz
 
@@ -16,23 +16,16 @@ You should have received a copy of the GNU General Public License
 along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 */
-#include "config.h"
-
-#include <errno.h>
+#include <ext/alloc_traits.h>
 #include <fcntl.h>
-#include <getopt.h>
 #include <limits.h>
 #include <locale.h>
-#include <stddef.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/resource.h>
-#include <sys/stat.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include <cstring>
-#include <cwchar>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -42,20 +35,20 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include "common.h"
 #include "env.h"
 #include "event.h"
-#include "expand.h"
 #include "fallback.h"  // IWYU pragma: keep
-#include "fish_version.h"
 #include "flog.h"
-#include "function.h"
 #include "future_feature_flags.h"
 #include "history.h"
-#include "intern.h"
 #include "io.h"
+#include "maybe.h"
+#include "parse_constants.h"
+#include "parse_tree.h"
+#include "parse_util.h"
 #include "parser.h"
 #include "path.h"
 #include "proc.h"
-#include "reader.h"
 #include "signal.h"
+#include "wchar.h"
 #include "wcstringutil.h"
 #include "wutil.h"  // IWYU pragma: keep
 
@@ -202,17 +195,68 @@ int try_open(int fd, const std::string& path, int flags) {
     return open(path.c_str(), flags | O_CLOEXEC);
 }
 
-int my_read_loop(parser_t &parser) {
+// Copied from escape_string_pcre2, changing escaped chars. Obviously super insecure
+// The actual RFC is at https://www.ietf.org/rfc/rfc4627.txt (Section 2.5)
+wcstring escape_string_json(const wcstring& in) {
+    wcstring out;
+    out.reserve(in.size() * 1.3);  // a wild guess
+    wchar_t hex_buf[7]; // \uXXXX is 6 chars, plus NUL
+
+    for (auto c : in) {
+        switch (c) {
+            case L'\b':
+                out.append(L"\\b");
+                break;
+            case L'\r':
+                out.append(L"\\r");
+                break;
+            case L'\n':
+                out.append(L"\\n");
+                break;
+            case L'\t':
+                out.append(L"\\t");
+                break;
+            case L'\f':
+                out.append(L"\\f");
+                break;
+            case L'\\':
+            case L'"':
+                out.push_back('\\');
+                /* FALLTHROUGH */
+            default:
+                if (c < ' ') {
+                    swprintf(hex_buf, 7, L"\\u%4x", c);
+                    out.append(hex_buf);
+                } else {
+                    out.push_back(c);
+                }
+        }
+    }
+
+    return out;
+}
+
+//void server_send_msg(bool done, int exit, const wcstring& dir) {
+//    // Write directly to stdout, foregoing the FILE* (We could also disable buffering on stdout)
+//    dprintf(STDOUT_FILENO, "{\"Done\": %s, \"Exit\": %d, \"Dir\": \"%ls\"}\n",
+//            done ? "true" : "false", exit, escape_string_json(dir).c_str());
+//}
+
+int server_read_loop(parser_t &parser) {
     // TODO: Don't use iostream. See wcstringutil for internal versions of string functions
     // In particular, wcstring_tok() looks similar
-    const std::string whitespace = " \t\n";
+    const std::string whitespace = " \t\n\r";
     int in_fd = 0, out_fd = 1, err_fd = 2;
-    // We'll overwrite the vector when we run the "stdio" method.
-    io_chain_t ios {
-        std::make_shared<io_fd_t>(STDIN_FILENO, STDIN_FILENO),
-        std::make_shared<io_fd_t>(STDOUT_FILENO, STDOUT_FILENO),
+    // Set up dummy redirections for now. We'll overwrite the vector when we run the "stdio" method.
+    // TODO: Doesn't apply in the preexec/postexec events :(
+    io_chain_t redirections {
+        std::make_shared<io_fd_t>(STDIN_FILENO, STDERR_FILENO),
+        std::make_shared<io_fd_t>(STDOUT_FILENO, STDERR_FILENO),
         std::make_shared<io_fd_t>(STDERR_FILENO, STDERR_FILENO)
     };
+    // Things that still get sent to stderr:
+    // - Dynamic parse errors like "unknown command". Could probably still look them up?
+    // - time command (timer.cpp#L208)
 
     std::string message;
     // Read entire message until NUL
@@ -245,32 +289,59 @@ int my_read_loop(parser_t &parser) {
             in_fd = try_open(in_fd, in, O_RDONLY);
             out_fd = try_open(out_fd, out, O_WRONLY);
             err_fd = try_open(err_fd, err, O_WRONLY);
-//            ios.push_back(std::make_shared<io_fd_t>(STDIN_FILENO, in_fd));
-//            ios.push_back(std::make_shared<io_fd_t>(STDOUT_FILENO, out_fd));
-//            ios.push_back(std::make_shared<io_fd_t>(STDERR_FILENO, err_fd));
-            ios[0] = std::make_shared<io_fd_t>(STDIN_FILENO, in_fd);
-            ios[1] = std::make_shared<io_fd_t>(STDOUT_FILENO, out_fd);
-            ios[2] = std::make_shared<io_fd_t>(STDERR_FILENO, err_fd);
+            redirections[0] = std::make_shared<io_fd_t>(STDIN_FILENO, in_fd);
+            redirections[1] = std::make_shared<io_fd_t>(STDOUT_FILENO, out_fd);
+            redirections[2] = std::make_shared<io_fd_t>(STDERR_FILENO, err_fd);
         } else if (method == "run") {
             // TODO: read_i() does some history manipulation that we need
-            std::string commandstr;
-            if (pos == std::string::npos) {
-                commandstr = {};
-            } else {
-                commandstr = message.substr(pos);
+            std::string cmdstr;
+            if (pos != std::string::npos) {
+                cmdstr = message.substr(pos);
             }
 
-            wcstring command = str2wcstring(commandstr);
-//            auto src = parse_source(command, parse_flag_none, {});
-            parser.eval(command, ios);
-            int status = parser.get_last_status();
+            parse_error_list_t errors;
+            auto src = parse_source(str2wcstring(cmdstr), parse_flag_none, &errors);
+            if (src != nullptr && parse_util_detect_errors(src->ast, src->src, &errors)) {
+                src = nullptr;
+            }
+            // TODO: Use src==nullptr and parser.get_backtrace?
+            if (!errors.empty()) {
+                // TODO: return error message directly along with Done: true
+                dprintf(STDOUT_FILENO, "{\"Done\": true, \"Exit\": %d}\n", STATUS_ILLEGAL_CMD);
+                fprintf(stderr, "Parse errors exist: %s\n", cmdstr.c_str());
+                for (const auto& e : errors) {
+                    fprintf(stderr, "error: %ls\n", e.text.c_str());
+                }
+                continue;
+            }
+
+            // TODO: Cancel eval on SIGINT (Could still have a long-running loop: `for true; end`)
+            //       Or do something crazy like run the parser in its own thread?
+
+            event_fire_generic(parser, L"fish_preexec");
+            auto result = parser.eval(src, redirections);
+            job_reap(parser, true);
+            // TODO: Find out what new jobs were created
+
+            bool exit = parser.libdata().exit_current_script;
+            parser.libdata().exit_current_script = false;
+
+            int status = result.status.status_value();
+            // TODO: Reset status before next command? ("set" doesn't seem to update status)
+            event_fire_generic(parser, L"fish_postexec");
+
             // Could also call builtin_pwd
             wcstring dir;
             if (auto tmp = parser.vars().get(L"PWD")) {
                 dir = tmp->as_string();
             }
-            fprintf(stdout, "{\"Done\": true, \"Exit\": %d, \"Dir\": \"%ls\"}\n", status, dir.c_str());
+            // Write directly to stdout, foregoing the FILE* (We could also disable buffering on stdout)
+            dprintf(STDOUT_FILENO, "{\"Done\": true, \"Exit\": %d, \"Dir\": \"%ls\"}\n",
+                    status, escape_string_json(dir).c_str());
 
+            if (exit) {
+                return 0;
+            }
         } else if (method == "exit") {
             return 0;
         } else {
@@ -287,6 +358,7 @@ int my_read_loop(parser_t &parser) {
 // - Features that depend on fish or env vars, like $fish_features and $FISH_DEBUG
 int main(int argc, char **argv) {
     int res = 1;
+    UNUSED(argc);
 
     program_name = L"fish";
     set_main_thread();
@@ -315,30 +387,22 @@ int main(int argc, char **argv) {
     paths = determine_config_directory_paths(argv[0]);
     env_init(&paths);
 
-    // Set features early in case other initialization depends on them.
-    // Start with the ones set in the environment, then those set on the command line (so the
-    // command line takes precedence).
-    if (auto features_var = env_stack_t::globals().get(L"fish_features")) {
-        for (const wcstring &s : features_var->as_list()) {
-            mutable_fish_features().set_from_string(s);
-        }
-    }
-
     proc_init();
     builtin_init();
     misc_init();
-    reader_init();
 
     parser_t &parser = parser_t::principal_parser();
 
     read_init(parser, paths);
 
     parser.libdata().is_interactive = true;
+    // Not really confident this works. SIGINTs still seem to end the program.
+    signal_set_handlers(true);
     // ---------------------------------------
     // THIS IS THE MAIN INTERACTIVE LOOP
-    res = my_read_loop(parser);
+    res = server_read_loop(parser);
     // ---------------------------------------
-
+    event_fire_generic(parser, L"fish_exit");
 
     int exit_status = res ? STATUS_CMD_UNKNOWN : parser.get_last_status();
 
@@ -349,11 +413,9 @@ int main(int argc, char **argv) {
     wcstring_list_t event_args = {to_string(exit_status)};
     event_fire_generic(parser, L"fish_exit", &event_args);
 
-    restore_term_mode();
-    restore_term_foreground_process_group_for_exit();
-
     history_save_all();
 
-    exit_without_destructors(exit_status);
+    // We don't need to use the last exit status from the parser.
+    exit_without_destructors(0);
     return EXIT_FAILURE;  // above line should always exit
 }

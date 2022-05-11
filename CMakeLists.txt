@@ -188,9 +188,9 @@ add_executable(fish src/fish.cpp)
 fish_link_deps_and_sign(fish)
 
 # Define fish_server.
+add_library(libc_overrides src/libc_overrides.c)
 add_executable(fish_server src/fish_server.cpp)
 fish_link_deps_and_sign(fish_server)
-add_library(libc_overrides src/libc_overrides.c)
 target_link_libraries(fish_server libc_overrides)
 target_link_options(fish_server PUBLIC "LINKER:--wrap=tcgetattr,\
 --wrap=tcsetattr,\
